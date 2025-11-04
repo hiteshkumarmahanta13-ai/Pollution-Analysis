@@ -1,4 +1,4 @@
-# air_dashboard_multi_page.py (final with numeric colorbar legends)
+# air_dashboard_multi_page.py (fixed: robust None checks for city data)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -73,7 +73,7 @@ preloaded = find_default_files()
 # Sidebar: global controls, including shared Map City
 # ---------------------------
 st.sidebar.title("Controls")
-page = st.sidebar.radio("Select page", ["Overview (Visuals)", "Solution & Recommendations"])
+page = st.sidebar.radio("Select page", ["Overview (Visuals)", "ML & Recommendations"])
 
 st.sidebar.header("Data (upload or use defaults)")
 use_preloaded = False
@@ -103,7 +103,7 @@ delhi_df = get_df(uploaded_delhi, "delhi")
 
 if bbsr_df is None and delhi_df is None:
     st.sidebar.warning("No datasets loaded yet. Upload or place CSVs in working directory.")
-    # allow partial rendering; pages will show warnings if needed
+    # still allow app to run — pages will show clearer errors where needed
 
 # ---------------------------
 # Common parsing and helpers
@@ -166,17 +166,11 @@ def build_heatmap_deck(df_in, intensity_col="intensity", map_style="mapbox://sty
     return deck
 
 def render_legend(min_val, max_val, width=340, title="Intensity"):
-    """
-    Render an HTML gradient legend with numeric ticks between min_val and max_val.
-    """
-    # avoid zero-range
     if min_val is None or max_val is None:
         st.markdown("No data for legend.")
         return
     if math.isclose(min_val, max_val):
-        # expand a little for display
         min_val, max_val = min_val - 0.1, max_val + 0.1
-    # tick positions (0%,25%,50%,75%,100%)
     tick_vals = [min_val + (max_val - min_val) * f for f in [0, 0.25, 0.5, 0.75, 1.0]]
     html = f"""
     <div style="display:flex; flex-direction:column; width:{width}px; font-family: sans-serif;">
@@ -207,10 +201,18 @@ if page == "Overview (Visuals)":
     if view_mode == "Single city analysis":
         # Single-city analysis controls (city for analysis is independent from map_city)
         analysis_city = st.sidebar.selectbox("Analysis city", ["Bhubaneswar", "Delhi"])
-        df = bbsr_df.copy() if analysis_city == "Bhubaneswar" else delhi_df.copy()
-        if df is None:
-            st.error(f"{analysis_city} data not available.")
-            st.stop()
+
+        # Safely pick analysis dataframe
+        if analysis_city == "Bhubaneswar":
+            if bbsr_df is None:
+                st.error("Bhubaneswar data not available. Upload it in the sidebar or enable defaults.")
+                st.stop()
+            df = bbsr_df.copy()
+        else:
+            if delhi_df is None:
+                st.error("Delhi data not available. Upload it in the sidebar or enable defaults.")
+                st.stop()
+            df = delhi_df.copy()
 
         # pollutants auto-detect
         date_cols = [c for c in df.columns if "date" in c.lower() or "time" in c.lower()]
@@ -288,65 +290,71 @@ if page == "Overview (Visuals)":
         # -----------------------
         st.subheader("🌡️ Pollution Heat Map (monthly)")
 
-        df_map_source = bbsr_df.copy() if map_city == "Bhubaneswar" else delhi_df.copy()
-        if df_map_source is None:
-            st.error(f"No data available for map city: {map_city}")
+        # Use the shared map_city selection for the map data source
+        if map_city == "Bhubaneswar":
+            if bbsr_df is None:
+                st.error("Map city Bhubaneswar data not available. Upload it or enable defaults.")
+                st.stop()
+            df_map_source = bbsr_df.copy()
         else:
-            df_map = ensure_latlon(df_map_source, map_city)
-            pollutants_present = [p for p in selected_pollutants if p in df_map.columns]
-            if pollutants_present:
-                df_map[pollutants_present] = df_map[pollutants_present].apply(pd.to_numeric, errors="coerce").fillna(0)
-                df_map["intensity"] = df_map[pollutants_present].mean(axis=1)
-                intensity_source = f"Average of {', '.join(pollutants_present)}"
+            if delhi_df is None:
+                st.error("Map city Delhi data not available. Upload it or enable defaults.")
+                st.stop()
+            df_map_source = delhi_df.copy()
+
+        df_map = ensure_latlon(df_map_source, map_city)
+        pollutants_present = [p for p in selected_pollutants if p in df_map.columns]
+        if pollutants_present:
+            df_map[pollutants_present] = df_map[pollutants_present].apply(pd.to_numeric, errors="coerce").fillna(0)
+            df_map["intensity"] = df_map[pollutants_present].mean(axis=1)
+            intensity_source = f"Average of {', '.join(pollutants_present)}"
+        else:
+            pm25c = find_pm25_cols(df_map)
+            if pm25c:
+                df_map["intensity"] = pd.to_numeric(df_map[pm25c[0]], errors="coerce").fillna(0)
+                intensity_source = pm25c[0]
             else:
-                pm25c = find_pm25_cols(df_map)
-                if pm25c:
-                    df_map["intensity"] = pd.to_numeric(df_map[pm25c[0]], errors="coerce").fillna(0)
-                    intensity_source = pm25c[0]
+                df_map["intensity"] = 0
+                intensity_source = "N/A"
+
+        if "month" in df_map.columns:
+            month_label_map = {0: "All", 1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+                               7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+            selected_month = st.slider("Select month (0 = All)", min_value=0, max_value=12, value=0, step=1)
+            deck_placeholder = st.empty()
+            legend_placeholder = st.empty()
+
+            def render_month_map(month_val):
+                if month_val == 0:
+                    df_plot = df_map.copy()
                 else:
-                    df_map["intensity"] = 0
-                    intensity_source = "N/A"
+                    df_plot = df_map[df_map["month"] == month_val]
+                    if df_plot.empty:
+                        deck_placeholder.info(f"No data for {month_label_map.get(month_val, month_val)} in {map_city}")
+                        legend_placeholder.empty()
+                        return
+                deck_placeholder.pydeck_chart(build_heatmap_deck(df_plot))
+                vmin = float(df_plot["intensity"].min())
+                vmax = float(df_plot["intensity"].max())
+                with legend_placeholder:
+                    render_legend(vmin, vmax, title=f"Intensity ({map_city} - {month_label_map.get(month_val)})")
 
-            if "month" in df_map.columns:
-                month_label_map = {0: "All", 1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-                                   7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
-                selected_month = st.slider("Select month (0 = All)", min_value=0, max_value=12, value=0, step=1)
-                deck_placeholder = st.empty()
-                legend_placeholder = st.empty()
+            render_month_map(selected_month)
 
-                def render_month_map(month_val):
-                    if month_val == 0:
-                        df_plot = df_map.copy()
-                    else:
-                        df_plot = df_map[df_map["month"] == month_val]
-                        if df_plot.empty:
-                            deck_placeholder.info(f"No data for {month_label_map.get(month_val, month_val)} in {map_city}")
-                            legend_placeholder.empty()
-                            return
-                    deck_placeholder.pydeck_chart(build_heatmap_deck(df_plot))
-                    # compute min/max for legend
-                    vmin = float(df_plot["intensity"].min())
-                    vmax = float(df_plot["intensity"].max())
-                    with legend_placeholder:
-                        render_legend(vmin, vmax, title=f"Intensity ({map_city} - {month_label_map.get(month_val)})")
-
+            if st.button("Play animation (Jan → Dec)"):
+                for m in range(1, 13):
+                    render_month_map(m)
+                    st.markdown(f"**Showing month:** {month_label_map[m]} (Map city: {map_city})")
+                    time.sleep(0.6)
                 render_month_map(selected_month)
+        else:
+            st.info("No 'month' column detected for map city; showing full heatmap.")
+            st.pydeck_chart(build_heatmap_deck(df_map))
+            vmin = float(df_map["intensity"].min()) if "intensity" in df_map.columns else 0.0
+            vmax = float(df_map["intensity"].max()) if "intensity" in df_map.columns else 0.0
+            render_legend(vmin, vmax, title=f"Intensity ({map_city} - All months)")
 
-                if st.button("Play animation (Jan → Dec)"):
-                    for m in range(1, 13):
-                        render_month_map(m)
-                        st.markdown(f"**Showing month:** {month_label_map[m]} (Map city: {map_city})")
-                        time.sleep(0.6)
-                    render_month_map(selected_month)
-            else:
-                st.info("No 'month' column detected for map city; showing full heatmap.")
-                st.pydeck_chart(build_heatmap_deck(df_map))
-                # legend for full map
-                vmin = float(df_map["intensity"].min()) if "intensity" in df_map.columns else 0.0
-                vmax = float(df_map["intensity"].max()) if "intensity" in df_map.columns else 0.0
-                render_legend(vmin, vmax, title=f"Intensity ({map_city} - All months)")
-
-            st.markdown(f"**Heatmap intensity source (map city = {map_city}):** {intensity_source}")
+        st.markdown(f"**Heatmap intensity source (map city = {map_city}):** {intensity_source}")
 
     else:
         # Compare cities view
@@ -443,10 +451,10 @@ if page == "Overview (Visuals)":
                         render_legend(float(d_df_map["intensity"].min()), float(d_df_map["intensity"].max()), title="Intensity (Delhi - All months)")
 
 # ---------------------------
-# Page: Solution & Recommendations (city-specific map uses shared map_city)
+# Page: ML & Recommendations (city-specific map uses shared map_city)
 # ---------------------------
 else:
-    st.title("Solution & Tree Recommendations")
+    st.title("ML & Tree Recommendations")
     if bbsr_df is None and delhi_df is None:
         st.error("At least one dataset required. Upload data in sidebar.")
         st.stop()
@@ -561,28 +569,27 @@ else:
     # Interactive tree zone map (city-specific using shared map_city)
     st.subheader("Tree Zone Map (interactive markers & benefits)")
 
-    # pick the dataframe for the selected map city
-    df_city = bbsr_df.copy() if city_for_map == "Bhubaneswar" else delhi_df.copy()
-    if df_city is None or df_city.empty:
-        st.error(f"No data available for {city_for_map}.")
+    # pick the dataframe for the selected map city safely
+    if city_for_map == "Bhubaneswar":
+        if bbsr_df is None:
+            st.error("Bhubaneswar data not available for map. Upload it or enable defaults.")
+            st.stop()
+        df_city = bbsr_df.copy()
     else:
-        df_city = ensure_latlon(df_city, city_for_map)
+        if delhi_df is None:
+            st.error("Delhi data not available for map. Upload it or enable defaults.")
+            st.stop()
+        df_city = delhi_df.copy()
 
-        # compute intensity using only pollutants available in this city
-        if selected_pollutants_for_rec:
-            pollutants_in_city = [p for p in selected_pollutants_for_rec if p in df_city.columns]
-            if pollutants_in_city:
-                df_city[pollutants_in_city] = df_city[pollutants_in_city].apply(pd.to_numeric, errors="coerce").fillna(0)
-                df_city["intensity"] = df_city[pollutants_in_city].mean(axis=1)
-                intensity_source = f"Average of {', '.join(pollutants_in_city)} (city-specific)"
-            else:
-                pm25_cols_local = [c for c in df_city.columns if "pm" in c.lower() and ("2.5" in c.lower() or "pm25" in c.lower())]
-                if pm25_cols_local:
-                    df_city["intensity"] = pd.to_numeric(df_city[pm25_cols_local[0]], errors="coerce").fillna(0)
-                    intensity_source = pm25_cols_local[0]
-                else:
-                    df_city["intensity"] = 0
-                    intensity_source = "N/A"
+    df_city = ensure_latlon(df_city, city_for_map)
+
+    # compute intensity using only pollutants available in this city
+    if selected_pollutants_for_rec:
+        pollutants_in_city = [p for p in selected_pollutants_for_rec if p in df_city.columns]
+        if pollutants_in_city:
+            df_city[pollutants_in_city] = df_city[pollutants_in_city].apply(pd.to_numeric, errors="coerce").fillna(0)
+            df_city["intensity"] = df_city[pollutants_in_city].mean(axis=1)
+            intensity_source = f"Average of {', '.join(pollutants_in_city)} (city-specific)"
         else:
             pm25_cols_local = [c for c in df_city.columns if "pm" in c.lower() and ("2.5" in c.lower() or "pm25" in c.lower())]
             if pm25_cols_local:
@@ -591,69 +598,77 @@ else:
             else:
                 df_city["intensity"] = 0
                 intensity_source = "N/A"
-
-        if "intensity" in df_city.columns and df_city["intensity"].sum() > 0:
-            hotspots = df_city.nlargest(10, "intensity")[["lat", "lon", "intensity"]].reset_index(drop=True)
+    else:
+        pm25_cols_local = [c for c in df_city.columns if "pm" in c.lower() and ("2.5" in c.lower() or "pm25" in c.lower())]
+        if pm25_cols_local:
+            df_city["intensity"] = pd.to_numeric(df_city[pm25_cols_local[0]], errors="coerce").fillna(0)
+            intensity_source = pm25_cols_local[0]
         else:
-            hotspots = pd.DataFrame(columns=["lat", "lon", "intensity"])
+            df_city["intensity"] = 0
+            intensity_source = "N/A"
 
-        tree_benefits = {
-            "Neem":"Absorbs PM2.5, NO2, SO2, and CO2.",
-            "Peepal":"Releases oxygen at night; filters PM2.5.",
-            "Banyan":"Dust absorber; traps particulates.",
-            "Ashoka":"Good roadside dust absorber.",
-            "Gulmohar":"Traps dust; cooling canopy.",
-            "Cassia Fistula":"Absorbs SO2; ornamental.",
-            "Arjuna":"Tolerates gaseous pollutants.",
-            "Amaltas":"Cleans SO2-rich air.",
-            "Bael":"Absorbs toxic gases.",
-            "Mango":"Filters NO2, CO.",
-            "Jamun":"CO absorption; urban tolerant.",
-            "Tamarind":"Dust control, soil benefits."
-        }
+    if "intensity" in df_city.columns and df_city["intensity"].sum() > 0:
+        hotspots = df_city.nlargest(10, "intensity")[["lat", "lon", "intensity"]].reset_index(drop=True)
+    else:
+        hotspots = pd.DataFrame(columns=["lat", "lon", "intensity"])
 
-        markers = []
-        if len(hotspots) > 0 and rec_trees:
-            for i, row in hotspots.iterrows():
-                tree = rec_trees[i % len(rec_trees)]
-                markers.append({
-                    "lat": float(row["lat"]),
-                    "lon": float(row["lon"]),
-                    "tree": tree,
-                    "benefit": tree_benefits.get(tree, "Improves air"),
-                    "intensity": round(float(row["intensity"]), 2)
-                })
+    tree_benefits = {
+        "Neem":"Absorbs PM2.5, NO2, SO2, and CO2.",
+        "Peepal":"Releases oxygen at night; filters PM2.5.",
+        "Banyan":"Dust absorber; traps particulates.",
+        "Ashoka":"Good roadside dust absorber.",
+        "Gulmohar":"Traps dust; cooling canopy.",
+        "Cassia Fistula":"Absorbs SO2; ornamental.",
+        "Arjuna":"Tolerates gaseous pollutants.",
+        "Amaltas":"Cleans SO2-rich air.",
+        "Bael":"Absorbs toxic gases.",
+        "Mango":"Filters NO2, CO.",
+        "Jamun":"CO absorption; urban tolerant.",
+        "Tamarind":"Dust control, soil benefits."
+    }
 
-            marker_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=markers,
-                get_position='[lon, lat]',
-                get_color='[0, 150, 50, 200]',
-                get_radius=120,
-                pickable=True
-            )
-            text_layer = pdk.Layer(
-                "TextLayer",
-                data=markers,
-                get_position='[lon, lat]',
-                get_text='tree',
-                get_size=14,
-                get_color='[255,255,255]',
-                get_alignment_baseline="'bottom'"
-            )
-            view = pdk.ViewState(latitude=float(df_city["lat"].mean()), longitude=float(df_city["lon"].mean()), zoom=10)
-            tooltip = {"text":"🌳 Tree: {tree}\n💚 Benefit: {benefit}\n🔥 Intensity: {intensity}"}
-            deck = pdk.Deck(map_style="mapbox://styles/mapbox/outdoors-v12", initial_view_state=view, layers=[marker_layer, text_layer], tooltip=tooltip)
-            st.pydeck_chart(deck)
-            # legend for hotspots (intensity min/max)
-            if "intensity" in df_city.columns and not df_city["intensity"].isna().all():
-                render_legend(float(df_city["intensity"].min()), float(df_city["intensity"].max()), title=f"Intensity (hotspots - {city_for_map})")
-            st.markdown(f"Markers show suggested tree species & benefits for top pollution hotspots in **{city_for_map}** (intensity source: {intensity_source}).")
-        else:
-            st.info(f"No hotspots or recommended trees available for {city_for_map}. Try selecting different pollutants or check dataset completeness.")
+    markers = []
+    if len(hotspots) > 0 and rec_trees:
+        for i, row in hotspots.iterrows():
+            tree = rec_trees[i % len(rec_trees)]
+            markers.append({
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"]),
+                "tree": tree,
+                "benefit": tree_benefits.get(tree, "Improves air"),
+                "intensity": round(float(row["intensity"]), 2)
+            })
+
+        marker_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=markers,
+            get_position='[lon, lat]',
+            get_color='[0, 150, 50, 200]',
+            get_radius=120,
+            pickable=True
+        )
+        text_layer = pdk.Layer(
+            "TextLayer",
+            data=markers,
+            get_position='[lon, lat]',
+            get_text='tree',
+            get_size=14,
+            get_color='[255,255,255]',
+            get_alignment_baseline="'bottom'"
+        )
+        view = pdk.ViewState(latitude=float(df_city["lat"].mean()), longitude=float(df_city["lon"].mean()), zoom=10)
+        tooltip = {"text":"🌳 Tree: {tree}\n💚 Benefit: {benefit}\n🔥 Intensity: {intensity}"}
+        deck = pdk.Deck(map_style="mapbox://styles/mapbox/outdoors-v12", initial_view_state=view, layers=[marker_layer, text_layer], tooltip=tooltip)
+        st.pydeck_chart(deck)
+        # legend for hotspots (intensity min/max)
+        if "intensity" in df_city.columns and not df_city["intensity"].isna().all():
+            render_legend(float(df_city["intensity"].min()), float(df_city["intensity"].max()), title=f"Intensity (hotspots - {city_for_map})")
+        st.markdown(f"Markers show suggested tree species & benefits for top pollution hotspots in **{city_for_map}** (intensity source: {intensity_source}).")
+    else:
+        st.info(f"No hotspots or recommended trees available for {city_for_map}. Try selecting different pollutants or check dataset completeness.")
 
 # ---------------------------
 # End
 # ---------------------------
 st.markdown("---")
-st.caption("Two-page dashboard with shared Map City selection. Heatmap legends display numeric intensity ranges. Validate species suitability with local forestry guidance before planting.")
+st.caption("Two-page dashboard with robust dataset checks. Upload datasets in the sidebar or place them in the working folder. Validate species suitability with local forestry guidance before planting.")
