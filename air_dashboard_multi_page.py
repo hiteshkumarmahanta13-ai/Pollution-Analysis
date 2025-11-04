@@ -1,4 +1,8 @@
-# air_dashboard_multi_page.py (fixed: robust None checks for city data)
+# air_dashboard_multi_page.py
+# Patched: Mapbox token handling + default CSVs from /mnt/data if present
+import os
+import math
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,8 +11,6 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import pydeck as pdk
 import joblib
-import math
-import time
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
@@ -18,6 +20,28 @@ from sklearn.metrics import mean_squared_error, r2_score
 # Page config
 # ---------------------------
 st.set_page_config(page_title="Air Pollution Dashboard (2-pages)", layout="wide")
+
+# ---------------------------
+# Mapbox token setup (robust)
+# ---------------------------
+def get_mapbox_token():
+    # 1) Try Streamlit secrets (Streamlit Cloud)
+    try:
+        token = st.secrets.get("MAPBOX_API_KEY")  # returns None if not set
+        if token:
+            return token
+    except Exception:
+        pass
+    # 2) Try environment variables (common names)
+    token = os.getenv("MAPBOX_API_KEY") or os.getenv("MAPBOX_TOKEN") or os.getenv("MAPBOX_ACCESS_TOKEN")
+    return token
+
+MAPBOX_TOKEN = get_mapbox_token()
+if MAPBOX_TOKEN:
+    pdk.settings.mapbox_api_key = MAPBOX_TOKEN
+    st.sidebar.success("Mapbox token loaded — using Mapbox basemaps.")
+else:
+    st.sidebar.warning("No Mapbox token found. App will use a token-free basemap (OpenStreetMap). Add MAPBOX_API_KEY in app secrets to enable Mapbox styles.")
 
 # ---------------------------
 # Model save/load helpers
@@ -56,15 +80,24 @@ def load_csv_safe(path):
 
 @st.cache_data
 def find_default_files():
-    base_dirs = [Path.cwd(), Path.cwd() / "data"]
+    """
+    Prefer CSVs provided in /mnt/data (uploaded to session), otherwise look in repo working dir or data/ folder.
+    """
     found = {}
+    # 1) container/session upload location
+    m_b = Path("/mnt/data/bbsr_cleaned.csv")
+    m_d = Path("/mnt/data/delhi_cleaned.csv")
+    if m_b.exists(): found["bbsr"] = str(m_b)
+    if m_d.exists(): found["delhi"] = str(m_d)
+    # 2) working directory + data folder fallback
+    base_dirs = [Path.cwd(), Path.cwd() / "data"]
     for base in base_dirs:
         if not base.exists():
             continue
         b = base / "bbsr_cleaned.csv"
         d = base / "delhi_cleaned.csv"
-        if b.exists(): found["bbsr"] = str(b)
-        if d.exists(): found["delhi"] = str(d)
+        if b.exists() and "bbsr" not in found: found["bbsr"] = str(b)
+        if d.exists() and "delhi" not in found: found["delhi"] = str(d)
     return found
 
 preloaded = find_default_files()
@@ -77,8 +110,8 @@ page = st.sidebar.radio("Select page", ["Overview (Visuals)", "ML & Recommendati
 
 st.sidebar.header("Data (upload or use defaults)")
 use_preloaded = False
-if "bbsr" in preloaded and "delhi" in preloaded:
-    st.sidebar.success("Found default CSVs in working folder.")
+if "bbsr" in preloaded or "delhi" in preloaded:
+    st.sidebar.success("Default CSVs detected in working folder or /mnt/data.")
     use_preloaded = st.sidebar.checkbox("Use default CSVs", value=True)
 
 uploaded_bbsr = st.sidebar.file_uploader("Upload Bhubaneswar CSV", type=["csv"], key="u_bbsr")
@@ -88,11 +121,14 @@ uploaded_delhi = st.sidebar.file_uploader("Upload Delhi CSV", type=["csv"], key=
 map_city = st.sidebar.selectbox("Map city (applies to maps on both pages)", ["Bhubaneswar", "Delhi"])
 
 def get_df(uploaded, keyname):
+    """
+    Returns dataframe either from upload, or from preloaded default file if selected.
+    """
     if uploaded is not None:
         try:
             return pd.read_csv(uploaded)
         except Exception as e:
-            st.sidebar.error(f"Could not read {keyname}: {e}")
+            st.sidebar.error(f"Could not read uploaded {keyname} CSV: {e}")
             return None
     elif use_preloaded and keyname in preloaded:
         return load_csv_safe(preloaded[keyname])
@@ -102,8 +138,7 @@ bbsr_df = get_df(uploaded_bbsr, "bbsr")
 delhi_df = get_df(uploaded_delhi, "delhi")
 
 if bbsr_df is None and delhi_df is None:
-    st.sidebar.warning("No datasets loaded yet. Upload or place CSVs in working directory.")
-    # still allow app to run — pages will show clearer errors where needed
+    st.sidebar.warning("No datasets loaded yet. Upload CSVs or enable defaults in the sidebar.")
 
 # ---------------------------
 # Common parsing and helpers
@@ -141,8 +176,23 @@ def ensure_latlon(df, city_name):
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce").fillna(lon_center)
     return df
 
-def build_heatmap_deck(df_in, intensity_col="intensity", map_style="mapbox://styles/mapbox/dark-v10"):
+# ---------------------------
+# Robust heatmap builder (uses Mapbox if token present; otherwise OpenStreetMap)
+# ---------------------------
+def build_heatmap_deck(df_in, intensity_col="intensity", prefer_mapbox_style="mapbox://styles/mapbox/light-v9"):
+    """
+    Returns a pydeck.Deck object.
+    If MAPBOX_TOKEN is available, uses Mapbox style; otherwise falls back to token-free OpenStreetMap.
+    """
     df_local = df_in.copy()
+    if intensity_col not in df_local.columns:
+        df_local[intensity_col] = 0
+
+    if MAPBOX_TOKEN:
+        map_style = prefer_mapbox_style
+    else:
+        map_style = "open-street-map"
+
     layer = pdk.Layer(
         "HeatmapLayer",
         data=df_local,
@@ -160,12 +210,19 @@ def build_heatmap_deck(df_in, intensity_col="intensity", map_style="mapbox://sty
             [180, 0, 0, 255]
         ]
     )
-    view = pdk.ViewState(latitude=float(df_local["lat"].mean()), longitude=float(df_local["lon"].mean()), zoom=10, pitch=40)
+
+    lat_mean = float(df_local["lat"].mean()) if "lat" in df_local.columns else (20.2961 if "bhubaneswar" in map_city.lower() else 28.7041)
+    lon_mean = float(df_local["lon"].mean()) if "lon" in df_local.columns else (85.8245 if "bhubaneswar" in map_city.lower() else 77.1025)
+
+    view = pdk.ViewState(latitude=lat_mean, longitude=lon_mean, zoom=10, pitch=40)
     deck = pdk.Deck(map_style=map_style, initial_view_state=view, layers=[layer],
                     tooltip={"text": "Lat: {lat}\nLon: {lon}\nIntensity: {intensity}"})
     return deck
 
 def render_legend(min_val, max_val, width=340, title="Intensity"):
+    """
+    Render an HTML gradient legend with numeric ticks between min_val and max_val.
+    """
     if min_val is None or max_val is None:
         st.markdown("No data for legend.")
         return
@@ -176,7 +233,7 @@ def render_legend(min_val, max_val, width=340, title="Intensity"):
     <div style="display:flex; flex-direction:column; width:{width}px; font-family: sans-serif;">
       <div style="font-weight:600; margin-bottom:6px;">{title}</div>
       <div style="height:16px; background: linear-gradient(to right, rgba(0,255,0,0), #ffff00, #ff8c00, #ff0000, #b40000); border-radius:4px;"></div>
-      <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:12px; color:#ddd;">
+      <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:12px; color:#111;">
         <span>{tick_vals[0]:.1f}</span>
         <span>{tick_vals[1]:.1f}</span>
         <span>{tick_vals[2]:.1f}</span>
@@ -274,8 +331,24 @@ if page == "Overview (Visuals)":
                 st.write("Scatter (choose two pollutants)")
                 p1 = st.selectbox("X pollutant", selected_pollutants, index=0)
                 p2 = st.selectbox("Y pollutant", selected_pollutants, index=1)
-                fig = px.scatter(df, x=p1, y=p2, trendline="ols", title=f"{p1} vs {p2}")
-                st.plotly_chart(fig, use_container_width=True)
+                # safe scatter + trendline fallback if statsmodels missing
+                x = pd.to_numeric(df[p1], errors="coerce")
+                y = pd.to_numeric(df[p2], errors="coerce")
+                valid = x.notna() & y.notna()
+                if valid.sum() < 2:
+                    st.info("Not enough valid points for scatter/trendline.")
+                else:
+                    import plotly.graph_objects as go
+                    scatter = go.Scatter(x=x[valid], y=y[valid], mode="markers", name="Data",
+                                         marker=dict(opacity=0.6))
+                    coeffs = np.polyfit(x[valid].to_numpy(), y[valid].to_numpy(), deg=1)
+                    poly = np.poly1d(coeffs)
+                    xs = np.linspace(x[valid].min(), x[valid].max(), 100)
+                    ys = poly(xs)
+                    trend = go.Scatter(x=xs, y=ys, mode="lines", name="Linear trend", line=dict(width=2))
+                    layout = go.Layout(title=f"{p1} vs {p2}", xaxis_title=p1, yaxis_title=p2)
+                    fig = go.Figure(data=[scatter, trend], layout=layout)
+                    st.plotly_chart(fig, use_container_width=True)
 
         # Correlation heatmap
         st.subheader("Correlation Heatmap")
@@ -286,7 +359,7 @@ if page == "Overview (Visuals)":
             st.pyplot(fig)
 
         # -----------------------
-        # Heatmap + Month Slider + Play (map uses map_city)
+        # Heatmap + Month Slider + Play (map uses map_city selection)
         # -----------------------
         st.subheader("🌡️ Pollution Heat Map (monthly)")
 
@@ -658,7 +731,7 @@ else:
         )
         view = pdk.ViewState(latitude=float(df_city["lat"].mean()), longitude=float(df_city["lon"].mean()), zoom=10)
         tooltip = {"text":"🌳 Tree: {tree}\n💚 Benefit: {benefit}\n🔥 Intensity: {intensity}"}
-        deck = pdk.Deck(map_style="mapbox://styles/mapbox/outdoors-v12", initial_view_state=view, layers=[marker_layer, text_layer], tooltip=tooltip)
+        deck = pdk.Deck(map_style="mapbox://styles/mapbox/outdoors-v12" if MAPBOX_TOKEN else "open-street-map", initial_view_state=view, layers=[marker_layer, text_layer], tooltip=tooltip)
         st.pydeck_chart(deck)
         # legend for hotspots (intensity min/max)
         if "intensity" in df_city.columns and not df_city["intensity"].isna().all():
@@ -671,4 +744,4 @@ else:
 # End
 # ---------------------------
 st.markdown("---")
-st.caption("Two-page dashboard with robust dataset checks. Upload datasets in the sidebar or place them in the working folder. Validate species suitability with local forestry guidance before planting.")
+st.caption("Two-page dashboard with robust Mapbox handling and defaults from /mnt/data when provided. Add MAPBOX_API_KEY to Streamlit app secrets to enable Mapbox basemaps; otherwise the app uses OpenStreetMap.")
