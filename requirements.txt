@@ -8,3 +8,4 @@ matplotlib>=3.6.2
 pydeck>=0.8.0
 joblib>=1.2.0
 scikit-learn>=1.2.2
+statsmodels>=0.14.0
